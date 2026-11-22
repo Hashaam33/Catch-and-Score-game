@@ -1,4 +1,4 @@
-# Iron Catch
+# HaxCraft
 
 A small DOS text-mode catching game written in 16-bit x86 assembly. Move the bucket beneath falling blocks, collect valuable ores, and avoid catching TNT.
 
