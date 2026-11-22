@@ -70,6 +70,21 @@ sun:
 	dw 0x6edb, 0x6edb, 0x6edb 
 	
 score:      dw 0
+; Falling-block state (screen coordinates; each block is 3x3)
+fallrow:    db 1
+fallcol:    db 0
+falltype:   db 0
+fallptr:    dw iron5
+fallvalue:  dw 5
+bucketcol:  db 39
+lastfall:   dw 0
+fallactive: db 0
+music_enabled: db 0
+music_index:   db 0
+music_next:    dw 0
+music_notes:   dw 3043, 2711, 2415, 2711, 3043, 3619, 3043, 2711
+               dw 2415, 2711, 3043, 4063, 3619, 3043, 2711, 2415
+bg_backup:  times 2000 dw 0
 starttick:  dw 0
 lastsec:    dw 0xFFFF
 
@@ -77,7 +92,7 @@ lbl_score:  db "SCORE: ", 0
 lbl_time:   db "TIME: ", 0
 lbl_gameover: db "GAME OVER", 0
 lbl_final:    db "FINAL SCORE: ", 0
-lbl_exitkey:  db "PRESS ANY KEY TO EXIT", 0
+lbl_exitkey:  db "PRESS ANY KEY TO RETURN HOME", 0
 
 numbuf:     db "0000", 0
 timebuf:    db "0:00", 0
@@ -178,18 +193,19 @@ start:
 	mov ah, 1
 	mov cx, 0x2000
 	int 0x10
-	
-	call titlescreen		
-	
-	
 
-	
-	mov ah, 1
+    call music_start
+menu_return:
+    call titlescreen
+    jmp menu_return
+
+    mov ah, 1
 	int 0x21
 	jmp quit
 
 
 quit:
+    call music_stop
 	mov ax, 0x0003
 	int 0x10
 	mov ax, 0x4c00
@@ -547,10 +563,16 @@ titlescreen:
 	call drawtitle
 .redraw:
 	call drawmenu
-.key:
-	mov ah, 0
-	int 0x16			
-	cmp ah, 0x48			; up arrow
+ .key:
+    mov ah, 1
+    int 0x16
+    jnz .key_ready
+    call music_tick
+    jmp .key
+.key_ready:
+    mov ah, 0
+    int 0x16
+    cmp ah, 0x48			; up arrow
 	je .up
 	cmp ah, 0x50			; down arrow
 	je .down
@@ -584,7 +606,6 @@ titlescreen:
 .play:
 
 	call drawscene
-	call draw_sprites
 	call gameloop
 	
 	ret
@@ -645,9 +666,15 @@ howtoscreen:
 	mov dl, 28
 	mov si, h7
 	call printstr
-	
-	mov ah, 0
-	int 0x16			; wait for any key
+ .wait_key:
+    mov ah, 1
+    int 0x16
+    jnz .got_key
+    call music_tick
+    jmp .wait_key
+.got_key:
+    mov ah, 0
+    int 0x16
 	
 	pop si
 	pop dx
@@ -657,56 +684,495 @@ howtoscreen:
 	ret
 	
 	
-; ---------- game loop: 2 minute timer ----------
+; ---------- game loop: timed falling blocks and 2 minute timer ----------
 gameloop:
-	mov word [score], 0
-	mov word [lastsec], 0xFFFF
-	
-	mov ah, 0
-	int 0x1A			; cx:dx = tick count
-	mov [starttick], dx
-	
-	call drawscore
-	
+    call music_stop
+    mov word [score], 0
+    mov word [lastsec], 0xFFFF
+    mov byte [bucketcol], 39
+    mov byte [fallactive], 0
+    mov ah, 0
+    int 0x1A
+    mov [starttick], dx
+    mov [lastfall], dx
+    call drawscore
+    call savebackground
+    call drawscore
+    call drawbucket_live
 .loop:
-	; non-blocking key check
-	mov ah, 1
-	int 0x16
-	jz .nokey
-	mov ah, 0
-	int 0x16			; consume the key
-	cmp al, 27			; ESC quits
-	jne .nokey
-	call pausegame
-	; (LEFT/RIGHT bucket movement will go here later)
-	
+    ; non-blocking keyboard input: arrows move, ESC opens pause
+    mov ah, 1
+    int 0x16
+    jz .nokey
+    mov ah, 0
+    int 0x16
+    cmp al, 27
+    je .pause
+    cmp ah, 0x4B
+    je .left
+    cmp ah, 0x4D
+    je .right
+    jmp .nokey
+.left:
+    cmp byte [bucketcol], 0
+    je .nokey
+    call erasebucket_live
+    dec byte [bucketcol]
+    call drawbucket_live
+    jmp .nokey
+.right:
+    cmp byte [bucketcol], 77
+    jae .nokey
+    call erasebucket_live
+    inc byte [bucketcol]
+    call drawbucket_live
+    jmp .nokey
+.pause:
+    call pausegame
 .nokey:
-	mov ah, 0
-	int 0x1A
-	sub dx, [starttick]		; elapsed ticks
-	mov ax, dx
-	mov bx, 5
-	mul bx				; ticks * 5
-	mov bx, 91
-	div bx				; / 91  ->  seconds (18.2 ticks/sec)
-	
-	cmp ax, 120
-	jae .timeup
-	
-	cmp ax, [lastsec]		; only redraw when the second changes
-	je .loop
-	mov [lastsec], ax
-	
-	mov bx, 120
-	sub bx, ax
-	mov ax, bx			; ax = seconds remaining
-	call drawtimer
-	jmp .loop
-	
+    ; Move or spawn a block once every 3 BIOS clock ticks (~0.165 sec).
+    mov ah, 0
+    int 0x1A
+    mov bx, dx
+    sub bx, [lastfall]
+    cmp bx, 3
+    jae .fall_due
+    jmp .timer
+.fall_due:
+    mov [lastfall], dx
+    cmp byte [fallactive], 0
+    je .spawn
+    call erasefalling
+    inc byte [fallrow]
+    cmp byte [fallrow], 18       ; next row makes block bottom touch bucket at row 20
+    jae .contact
+    call drawfalling
+    jmp .timer
+.spawn:
+    ; BIOS clock low bits select ore and horizontal start position.
+    mov ax, dx
+    xor ah, ah
+    mov bl, 5
+    div bl
+    mov [falltype], ah
+    mov byte [fallrow], 1
+    mov al, dl
+    xor ah, ah
+    mov bl, 78
+    div bl
+    mov [fallcol], ah
+    call selectfalltype
+    mov byte [fallactive], 1
+    call drawfalling
+    jmp .timer
+.contact:
+    mov byte [fallrow], 18
+    ; Collision is tested on the block's bottom row against the 3-cell bucket.
+    mov al, [fallcol]
+    add al, 2
+    cmp al, [bucketcol]
+    jb .miss
+    mov al, [bucketcol]
+    add al, 2
+    cmp [fallcol], al
+    ja .miss
+    ; Catch: apply score, then check TNT only on this caught path.
+    mov ax, [score]
+    add ax, [fallvalue]
+    jns .store_score
+    xor ax, ax
+.store_score:
+    mov [score], ax
+    call drawscore
+    mov byte [fallactive], 0
+    cmp byte [falltype], 4
+    jne .ore_sound
+    call tntsound
+    call gameoverscreen
+    ret
+.ore_sound:
+    call catchsound
+    jmp .timer
+.miss:
+    mov byte [fallactive], 0
+    jmp .timer
+.timer:
+    mov ah, 0
+    int 0x1A
+    sub dx, [starttick]
+    mov ax, dx
+    mov bx, 5
+    mul bx
+    mov bx, 91
+    div bx
+    cmp ax, 120
+    jae .timeup
+    cmp ax, [lastsec]
+    je .loop
+    mov [lastsec], ax
+    mov bx, 120
+    sub bx, ax
+    mov ax, bx
+    call drawtimer
+    jmp .loop
 .timeup:
-	call gameoverscreen
-	ret
+    call gameoverscreen
+    ret
 
+; Set pointer and score value for the selected ore.
+selectfalltype:
+    mov al, [falltype]
+    cmp al, 0
+    jne .gold
+    mov word [fallptr], iron5
+    mov word [fallvalue], 5
+    ret
+.gold:
+    cmp al, 1
+    jne .diamond
+    mov word [fallptr], gold10
+    mov word [fallvalue], 10
+    ret
+.diamond:
+    cmp al, 2
+    jne .magma
+    mov word [fallptr], diamond15
+    mov word [fallvalue], 15
+    ret
+.magma:
+    cmp al, 3
+    jne .tnt
+    mov word [fallptr], magmanegative
+    mov word [fallvalue], -20
+    ret
+.tnt:
+    mov word [fallptr], tntkill
+    mov word [fallvalue], 0
+    ret
+
+; Draw/erase the falling 3x3 block and bucket directly in text video memory.
+drawfalling:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+    mov ax, 0B800h
+    mov es, ax
+    xor ax, ax
+    mov al, [fallrow]
+    mov bx, 160
+    mul bx
+    xor bx, bx
+    mov bl, [fallcol]
+    shl bx, 1
+    add ax, bx
+    mov di, ax
+    mov si, [fallptr]
+    mov dx, 3
+.row:
+    mov cx, 3
+    rep movsw
+    add di, 154
+    dec dx
+    jnz .row
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+erasefalling:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+    mov ax, 0B800h
+    mov es, ax
+    xor ax, ax
+    mov al, [fallrow]
+    mov bx, 80
+    mul bx
+    xor bx, bx
+    mov bl, [fallcol]
+    add ax, bx
+    shl ax, 1
+    mov di, ax
+    mov si, bg_backup
+    add si, ax
+    mov dx, 3
+.row:
+    mov cx, 3
+    rep movsw
+    add di, 154
+    add si, 154
+    dec dx
+    jnz .row
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+erasebucket_live:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+    mov ax, 0B800h
+    mov es, ax
+    mov ax, 20*80
+    xor bx, bx
+    mov bl, [bucketcol]
+    add ax, bx
+    shl ax, 1
+    mov di, ax
+    mov si, bg_backup
+    add si, ax
+    mov dx, 3
+.row:
+    mov cx, 3
+    rep movsw
+    add di, 154
+    add si, 154
+    dec dx
+    jnz .row
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+drawbucket_live:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+    mov ax, 0B800h
+    mov es, ax
+    mov si, bucket
+    mov di, (20*80)*2
+    xor bx, bx
+    mov bl, [bucketcol]
+    shl bx, 1
+    add di, bx
+    mov dx, 3
+.row:
+    mov cx, 3
+    rep movsw
+    add di, 154
+    dec dx
+    jnz .row
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+savebackground:
+    push ax
+    push cx
+    push si
+    push di
+    push es
+    mov ax, 0B800h
+    mov es, ax
+    xor si, si
+    mov di, bg_backup
+    mov cx, 2000
+.copy:
+    mov ax, [es:si]
+    mov [di], ax
+    add si, 2
+    add di, 2
+    loop .copy
+    pop es
+    pop di
+    pop si
+    pop cx
+    pop ax
+    ret
+
+redraw_gameplay:
+    ; Retained for full scene refreshes such as resuming after pause.
+    call drawscene
+    call savebackground
+    call drawscore
+    call drawbucket_live
+    cmp byte [fallactive], 0
+    je .timer
+    call drawfalling
+.timer:
+    push ax
+    push bx
+    push dx
+    mov ah, 0
+    int 0x1A
+    sub dx, [starttick]
+    mov ax, dx
+    mov bx, 5
+    mul bx
+    mov bx, 91
+    div bx
+    mov bx, 120
+    sub bx, ax
+    mov ax, bx
+    call drawtimer
+    pop dx
+    pop bx
+    pop ax
+    ret
+; ---------- PC speaker effects ----------
+; Each tone lasts about 50 ms.
+playtone:
+    push ax
+    push cx
+    push dx
+    push bx
+    mov al, 0B6h
+    out 43h, al
+    mov ax, bx
+    out 42h, al
+    mov al, ah
+    out 42h, al
+    in al, 61h
+    or al, 3
+    out 61h, al
+    mov ah, 86h
+    xor cx, cx
+    mov dx, 50000
+    int 15h
+    in al, 61h
+    and al, 0FCh
+    out 61h, al
+    pop bx
+    pop dx
+    pop cx
+    pop ax
+    ret
+
+catchsound:
+    cmp byte [falltype], 3
+    jne .ore
+    mov bx, 3986             ; low tone for magma
+    jmp .play
+.ore:
+    mov bx, 1356             ; higher tone for ore catches
+.play:
+    call playtone
+    ret
+
+tntsound:
+    mov bx, 796              ; high alert tone
+    call playtone
+    mov bx, 2386             ; lower ending tone
+    call playtone
+    ret
+; ---------- non-blocking menu/pause background melody ----------
+music_start:
+    cmp byte [music_enabled], 1
+    je .done
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    mov byte [music_enabled], 1
+    mov byte [music_index], 0
+    mov ah, 0
+    int 1Ah
+    mov [music_next], dx
+    call music_setnote
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+.done:
+    ret
+
+music_stop:
+    push ax
+    mov byte [music_enabled], 0
+    in al, 61h
+    and al, 0FCh
+    out 61h, al
+    pop ax
+    ret
+
+music_tick:
+    cmp byte [music_enabled], 1
+    jne .done
+    push ax
+    push bx
+    push cx
+    push dx
+    mov ah, 0
+    int 1Ah
+    mov bx, dx
+    sub bx, [music_next]
+    cmp bx, 3                  ; advance each note every 3 BIOS ticks
+    jb .done_pop
+    mov [music_next], dx
+    inc byte [music_index]
+    cmp byte [music_index], 16
+    jb .play
+    mov byte [music_index], 0
+.play:
+    call music_setnote
+.done_pop:
+    pop dx
+    pop bx
+    pop cx
+    pop ax
+.done:
+    ret
+
+music_setnote:
+    push ax
+    push bx
+    push si
+    xor ax, ax
+    mov al, [music_index]
+    shl ax, 1
+    mov si, ax
+    mov bx, [music_notes+si]
+    mov al, 0B6h
+    out 43h, al
+    mov ax, bx
+    out 42h, al
+    mov al, ah
+    out 42h, al
+    in al, 61h
+    or al, 3
+    out 61h, al
+    pop si
+    pop bx
+    pop ax
+    ret
 
 ; ---------- score: top-left ----------
 drawscore:
@@ -804,6 +1270,7 @@ printnum:
 	
 ; ---------- pause: freezes timer, shows menu, restores screen ----------
 pausegame:
+    call music_start
 	push ax
 	push cx
 	push dx
@@ -813,9 +1280,15 @@ pausegame:
 	mov [pausetick], dx		; remember when we paused
 	
 	call pausemenu			; returns on RESUME, jumps to quit on EXIT
+    call music_stop
 	
 	call drawscene			; repaint the game screen
-	call draw_sprites
+    call savebackground
+    call drawbucket_live
+    cmp byte [fallactive], 0
+    je .pause_no_block
+    call drawfalling
+.pause_no_block:
 	call drawscore
 	
 	mov ah, 0
@@ -868,10 +1341,16 @@ pausemenu:
 	mov si, mid2u
 	call drawbutton
 	
-.key:
-	mov ah, 0
-	int 0x16
-	cmp ah, 0x48			; up
+ .key:
+    mov ah, 1
+    int 0x16
+    jnz .key_ready
+    call music_tick
+    jmp .key
+.key_ready:
+    mov ah, 0
+    int 0x16
+    cmp ah, 0x48			; up
 	je .toggle
 	cmp ah, 0x50			; down
 	je .toggle
@@ -896,6 +1375,16 @@ pausemenu:
 	
 ; ---------- end screen: scene only (no sprites), final score ----------
 gameoverscreen:
+    call music_start
+    ; Clear queued gameplay keys before showing the result.
+.flush_before:
+    mov ah, 1
+    int 0x16
+    jz .keys_clear
+    mov ah, 0
+    int 0x16
+    jmp .flush_before
+.keys_clear:
 	push ax
 	push bx
 	push cx
@@ -942,15 +1431,16 @@ gameoverscreen:
 	mov si, lbl_exitkey
 	call printstr
 
-	; flush any keys pressed during play so the screen doesn't vanish instantly
-.flush:
-	mov ah, 1
-	int 0x16
-	jz .done
-	mov ah, 0
-	int 0x16
-	jmp .flush
-.done:
+	    ; Wait for a fresh keypress before returning to the home menu.
+ .wait_key:
+    mov ah, 1
+    int 0x16
+    jnz .got_key
+    call music_tick
+    jmp .wait_key
+.got_key:
+    mov ah, 0
+    int 0x16
 	pop si
 	pop dx
 	pop cx
@@ -1423,3 +1913,18 @@ bucket_row:
 	
 	
 	
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
